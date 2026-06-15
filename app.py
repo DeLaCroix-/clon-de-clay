@@ -4,139 +4,162 @@ import pandas as pd
 import openai
 import requests
 import time
+from pathlib import Path
 from io import BytesIO
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
-# Cargar variables de entorno (para local, en producción usará las secrets)
-load_dotenv()
+# Cargar .env desde la misma carpeta que este script (evita problemas de CWD en Streamlit)
+_env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=_env_path)
 
-# Configuración de la página
-st.set_page_config(page_title="Clay Pipeline Replica", layout="wide")
-
-st.title("Pipeline de Enriquecimiento de Leads (Clon de Clay)")
-st.markdown("""
-Esta herramienta replica el comportamiento de **Clay** para el enriquecimiento de leads de cold email. 
-Toma un CSV con columnas `name`, `website`, `state`, y `email`, y añade:
-1. `companyName`: Nombre normalizado (IA).
-2. `servicio_destacado`: Servicio principal extraído de la web (Scraping + IA).
-3. `icebreaker`: Frase de apertura SEO generada (IA).
-""")
+st.set_page_config(page_title="Clon de Clay", layout="wide")
+st.title("Pipeline de Enriquecimiento de Leads")
 
 # ==========================================
-# 1. SIDEBAR: Configuración y API Keys
+# SIDEBAR: Estado de APIs
 # ==========================================
-st.sidebar.header("⚙️ Configuración")
+st.sidebar.header("Estado de APIs")
 
-# Las API keys ahora se cargan de forma segura desde variables de entorno o Secrets
-openai_api_key = os.environ.get("OPENAI_API_KEY")
-serper_api_key = os.environ.get("SERPER_API_KEY")
-jina_api_key = os.environ.get("JINA_API_KEY")
+openai_api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
+serper_api_key = os.environ.get("SERPER_API_KEY") or st.secrets.get("SERPER_API_KEY", "")
+jina_api_key = os.environ.get("JINA_API_KEY") or st.secrets.get("JINA_API_KEY", "")
+
+st.sidebar.markdown(f"- OpenAI: {'✅ Conectada' if openai_api_key else '❌ Falta'}")
+st.sidebar.markdown(f"- Serper: {'✅ Conectada' if serper_api_key else '❌ Falta'}")
+st.sidebar.markdown(f"- Jina:   {'✅ Conectada' if jina_api_key else '⚠️ Opcional'}")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### Ajustes del Motor")
-max_filas = st.sidebar.number_input("Límite de filas a procesar (0 = todas)", min_value=0, value=10, step=1)
-
-# Inicializar cliente de OpenAI (se configurará cuando haya API key)
-client = None
+max_filas = st.sidebar.number_input("Filas a procesar (0 = todas)", min_value=0, value=10, step=1)
 
 # ==========================================
-# FUNCIONES DE ENRIQUECIMIENTO (LAS 3 FASES)
+# FUNCIONES
 # ==========================================
 
 def get_openai_client():
     if not openai_api_key:
-        raise ValueError("Falta la API Key de OpenAI")
+        raise ValueError("OPENAI_API_KEY no configurada")
     return openai.OpenAI(api_key=openai_api_key)
 
-def normalize_name(raw_name: str) -> str:
-    """Fase 1: Normalización de nombres"""
-    if not raw_name or pd.isna(raw_name):
-        return ""
-    
-    prompt = f"""Limpia y normaliza el nombre de esta clínica o médico o empresa para usarlo en un email de marketing profesional en español. El valor original es: {raw_name}
 
-Reglas de limpieza:
-1. Si el nombre está todo junto sin espacios (ej: "Drcolomer", "Drlalinde", "Faceliftbarcelona", "Drgarcia Paricio"), separa correctamente las palabras y añade puntos donde corresponda (ej: "Dr. Colomer", "Dr. Lalinde", "Facelift Barcelona", "Dr. García Paricio").
-2. Si ya está bien escrito (ej: "DFINE Clinic", "Dr. Castro Sierra"), devuélvelo exactamente igual.
+def normalize_name(raw_name: str) -> str:
+    """Fase 1: Normalizar nombres sucios del scraping."""
+    if not raw_name or pd.isna(raw_name):
+        return str(raw_name) if raw_name else ""
+
+    prompt = f"""Limpia y normaliza el nombre de esta clínica o médico o empresa para usarlo en un email profesional en español. El valor original es: {raw_name}
+
+Reglas:
+1. Si está todo junto sin espacios (ej: "Drcolomer", "Faceliftbarcelona"), separa palabras y añade puntos donde corresponda (ej: "Dr. Colomer", "Facelift Barcelona").
+2. Si ya está bien escrito, devuélvelo igual.
 3. Corrige mayúsculas/minúsculas si es necesario.
-4. Devuelve SOLO el nombre limpio, sin explicaciones ni texto adicional."""
+4. Devuelve SOLO el nombre limpio, sin explicaciones."""
 
     try:
         c = get_openai_client()
-        response = c.chat.completions.create(
+        resp = c.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=50,
-            temperature=0.1
+            temperature=0.1,
         )
-        return response.choices[0].message.content.strip()
+        return resp.choices[0].message.content.strip()
     except Exception as e:
-        return str(raw_name)  # Fallback: devolver original si falla
+        st.warning(f"⚠️ Error normalizando '{raw_name}': {e}")
+        return str(raw_name)
+
 
 def get_servicio_destacado(website_url: str) -> str:
-    """Fase 2: Scraping + Extracción de Servicio Destacado"""
-    if not website_url or pd.isna(website_url):
+    """Fase 2: Leer la web con Jina y extraer el servicio principal con GPT-4o."""
+    if not website_url or pd.isna(website_url) or str(website_url).strip() == "":
         return "su servicio principal"
-    
-    # Asegurar que tiene http/https
+
+    website_url = str(website_url).strip()
     if not website_url.startswith("http"):
         website_url = "https://" + website_url
 
-    # Paso 1: Usar Jina Reader API para obtener contenido limpio en Markdown
+    # Paso 1: Obtener contenido de la web via Jina Reader
+    text_content = ""
     jina_url = f"https://r.jina.ai/{website_url}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "text/plain",
+    }
     if jina_api_key:
         headers["Authorization"] = f"Bearer {jina_api_key}"
-    
-    text_content = ""
+
     try:
-        res = requests.get(jina_url, headers=headers, timeout=15)
-        if res.status_code == 200:
-            text_content = res.text[:4000] # Limitar a los primeros 4000 caracteres
-    except Exception as e:
+        res = requests.get(jina_url, headers=headers, timeout=20)
+        if res.status_code == 200 and len(res.text.strip()) > 50:
+            text_content = res.text[:4000]
+    except Exception:
         pass
-    
+
+    # Fallback: si Jina falla, intentar scraping directo básico
+    if not text_content:
+        try:
+            res = requests.get(
+                website_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=10,
+                verify=False,
+            )
+            if res.status_code == 200:
+                from bs4 import BeautifulSoup
+                soup = BeautifulSoup(res.text, "html.parser")
+                parts = []
+                for tag in soup.find_all(["title", "h1", "h2", "h3", "meta"]):
+                    txt = tag.get_text(separator=" ", strip=True)
+                    if txt:
+                        parts.append(txt)
+                    desc = tag.get("content", "")
+                    if desc:
+                        parts.append(desc)
+                text_content = "\n".join(parts)[:3000]
+        except Exception:
+            pass
+
     if not text_content:
         return "su servicio principal"
 
-    # Paso 2: Usar GPT-4o para extraer el servicio principal de ese texto
+    # Paso 2: Extraer servicio con GPT-4o
     prompt = f"""Analiza este contenido de una web:
 
 {text_content}
 
-Dime cuál es el servicio o tratamiento más destacado que ofrecen en la empresa.
+Dime cuál es el servicio o tratamiento más destacado que ofrecen.
 Devuelve SOLO el nombre del servicio, en español, en 2-5 palabras máximo.
-Ejemplos: "rinoplastia de preservación", "medicina estética facial", "cirugía de párpados", "vaciado de naves industriales", "vaciado de pisos", "reparación de embragues" .
-Si no puedes determinarlo, devuelve "indeterminado".
+Ejemplos: "rinoplastia de preservación", "medicina estética facial", "cirugía de párpados".
+Si no puedes determinarlo, devuelve "su servicio principal".
 No expliques nada. Solo el nombre."""
 
     try:
         c = get_openai_client()
-        response = c.chat.completions.create(
+        resp = c.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=30,
-            temperature=0.3
+            temperature=0.3,
         )
-        result = response.choices[0].message.content.strip()
-        # Si GPT responde con algo muy largo por error, lo forzamos al fallback
+        result = resp.choices[0].message.content.strip().replace('"', '').replace("'", "")
         if len(result.split()) > 10:
             return "su servicio principal"
-        # Limpiar comillas si devolvió comillas
-        return result.replace('"', '').replace("'", "")
+        return result
     except Exception as e:
+        st.warning(f"⚠️ Error extrayendo servicio: {e}")
         return "su servicio principal"
 
+
 def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
-    """Búsqueda real en Google via Serper.dev (misma API que Motor SEO Beta de natconsulting-crm)"""
+    """Buscar en Google via Serper.dev y extraer ranking + competidores."""
     fallback = {
-        "competidores": "otros especialistas",
-        "ranking": "no hemos podido verificar vuestra posición",
+        "competidores": "",
+        "ranking": "",
         "posicion_exacta": -1,
     }
 
     if not serper_api_key:
+        st.warning("⚠️ SERPER_API_KEY no configurada, no se puede buscar en Google.")
         return fallback
 
     if not servicio or not ciudad or not website_url:
@@ -147,6 +170,7 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
     else:
         query = f"{servicio} en {ciudad}"
 
+    website_url = str(website_url).strip()
     try:
         parsed = urlparse(website_url if website_url.startswith("http") else f"https://{website_url}")
         lead_domain = parsed.netloc.replace("www.", "").lower()
@@ -154,7 +178,6 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
         lead_domain = website_url.lower()
 
     try:
-        # Payload idéntico al de beta-serp-fetch del Motor SEO Beta
         res = requests.post(
             "https://google.serper.dev/search",
             headers={
@@ -172,6 +195,7 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
         )
 
         if res.status_code != 200:
+            st.warning(f"⚠️ Serper devolvió status {res.status_code} para '{query}'")
             return fallback
 
         data = res.json()
@@ -181,18 +205,17 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
             return fallback
 
         # Filtrar YouTube y Maps (igual que beta-serp-fetch)
-        filtered = []
-        for r in organic:
-            url_lower = r.get("link", "").lower()
-            if any(s in url_lower for s in ("youtube.com", "youtu.be", "maps.google", "google.com/maps")):
-                continue
-            filtered.append(r)
+        filtered = [
+            r for r in organic
+            if not any(s in r.get("link", "").lower() for s in (
+                "youtube.com", "youtu.be", "maps.google", "google.com/maps"
+            ))
+        ]
 
-        # Re-indexar posiciones tras filtrado
         for idx, r in enumerate(filtered):
             r["_pos"] = idx + 1
 
-        # 1. Buscar la posición del lead
+        # Buscar posición del lead
         lead_pos = -1
         for r in filtered:
             if lead_domain in r.get("link", "").lower():
@@ -206,11 +229,11 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
         elif lead_pos <= 10:
             ranking_text = f"estáis en la posición {lead_pos} de la primera página"
         elif lead_pos <= 20:
-            ranking_text = f"estáis relegados a la posición {lead_pos} (página 2 de Google)"
+            ranking_text = f"estáis relegados a la posición {lead_pos} (página 2)"
         else:
-            ranking_text = f"estáis en la posición {lead_pos}, es decir, página 3 o inferior"
+            ranking_text = f"estáis en la posición {lead_pos} (página 3 o inferior)"
 
-        # 2. Extraer competidores reales (saltando directorios y al propio lead)
+        # Extraer competidores reales
         directorios = [
             "topdoctors", "doctoralia", "multiestetica", "sanitas",
             "quironsalud", "clinicbook", "wikipedia", "yelp",
@@ -230,14 +253,13 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
             clean_title = title.split(" - ")[0].split(" | ")[0].strip()
             if clean_title:
                 competidores.append({"nombre": clean_title, "posicion": r["_pos"]})
-
             if len(competidores) >= 2:
                 break
 
         if len(competidores) >= 2:
-            comps_text = f"{competidores[0]['nombre']} (posición {competidores[0]['posicion']}) y {competidores[1]['nombre']} (posición {competidores[1]['posicion']})"
+            comps_text = f"{competidores[0]['nombre']} (pos. {competidores[0]['posicion']}) y {competidores[1]['nombre']} (pos. {competidores[1]['posicion']})"
         elif len(competidores) == 1:
-            comps_text = f"{competidores[0]['nombre']} (posición {competidores[0]['posicion']})"
+            comps_text = f"{competidores[0]['nombre']} (pos. {competidores[0]['posicion']})"
         else:
             comps_text = "otros especialistas"
 
@@ -247,11 +269,13 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
             "posicion_exacta": lead_pos,
         }
 
-    except Exception:
+    except Exception as e:
+        st.warning(f"⚠️ Error en Serper para '{query}': {e}")
         return fallback
 
+
 def generate_icebreaker(company_name: str, city: str, servicio: str, competidores: str, google_page: str) -> str:
-    """Fase 3: Generación del Icebreaker SEO Prospección (centrado en competidores)"""
+    """Fase 3: Generar icebreaker centrado en competidores y ranking real."""
     if not company_name or not city:
         return ""
 
@@ -260,172 +284,166 @@ def generate_icebreaker(company_name: str, city: str, servicio: str, competidore
     if pd.isna(city):
         city = ""
 
-    prompt = f"""Eres un experto en copywriting de cold email B2B en español de España. Tu tarea es escribir UNA sola frase de apertura (icebreaker) para un email de prospección SEO.
+    prompt = f"""Eres un experto en copywriting de cold email B2B en español de España. Escribe UNA sola frase de apertura (icebreaker) para un email de prospección SEO.
 
-Esta frase debe:
+La frase debe:
 1. Decir que has buscado el servicio estrella de la empresa en Google en su ciudad
 2. Nombrar a sus competidores reales que están por encima (con su posición si la tienes)
 3. Señalar la posición o situación real del lead en Google
-4. Sonar natural, conversacional y profesional, como si lo escribiera una persona real de España
+4. Sonar natural, conversacional y profesional
 5. Tener máximo 2 líneas. Sin saludos, sin punto al final
 
-IMPORTANTE - Lenguaje: Escribe en español de España. NUNCA uses estas expresiones latinoamericanas:
+IMPORTANTE - Lenguaje: Español de España. NUNCA uses:
 - "Recientemente busqué" -> usa "He buscado" o "Buscando"
 - "Estuve buscando" -> usa "He estado buscando" o "Buscando"
 - "Explorando" -> usa "Buscando" o "Mirando"
 - "Me sorprendió" -> usa "He notado" o "He visto"
-Usa siempre construcciones con presente perfecto ("He buscado", "He visto") o gerundio ("Buscando").
+Usa presente perfecto ("He buscado", "He visto") o gerundio ("Buscando").
 
 Datos reales de la búsqueda en Google:
-- Empresa objetivo: {company_name}
+- Empresa: {company_name}
 - Ciudad: {city}
-- Búsqueda realizada en Google: "{servicio} en {city}"
-- Competidores que están por encima: {competidores}
+- Búsqueda: "{servicio} en {city}"
+- Competidores por encima: {competidores}
 - Posición del lead: {google_page}
 
-Ejemplo de estructura (NO la copies literal, úsala solo de guía para el tono):
+Ejemplo de tono (NO copies literal):
 "He buscado '{servicio} en {city}' como lo haría un paciente y he visto que {competidores} copan los primeros puestos, mientras que {company_name} {google_page}"
 
 Devuelve SOLO la frase. Sin comillas, sin explicaciones."""
 
     try:
         c = get_openai_client()
-        response = c.chat.completions.create(
+        resp = c.chat.completions.create(
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.7,
         )
-        result = response.choices[0].message.content.strip()
-        return result.replace('"', '')
-    except Exception:
+        return resp.choices[0].message.content.strip().replace('"', '')
+    except Exception as e:
+        st.warning(f"⚠️ Error generando icebreaker para '{company_name}': {e}")
         return ""
 
+
 # ==========================================
-# INTERFAZ PRINCIPAL: Carga y Ejecución
+# INTERFAZ PRINCIPAL
 # ==========================================
 
-uploaded_file = st.file_uploader("Sube tu archivo CSV de leads (Debe contener columnas: name, website, state, email)", type=["csv"])
+uploaded_file = st.file_uploader(
+    "Sube tu archivo CSV de leads (columnas esperadas: name, website, state, email)",
+    type=["csv"],
+)
 
 if uploaded_file is not None:
-    # Cargar CSV original
     df_original = pd.read_csv(uploaded_file)
-    
-    # Crear variables en el session state si no existen para mantener el df enriquecido
+
+    # Mostrar columnas detectadas para debug
+    st.caption(f"Columnas detectadas: {', '.join(df_original.columns.tolist())}")
+
     if "df_results" not in st.session_state:
-        # Preparar columnas si no existen
         df = df_original.copy()
-        if "companyName" not in df.columns:
-            df["companyName"] = ""
-        if "servicio_destacado" not in df.columns:
-            df["servicio_destacado"] = ""
-        if "icebreaker" not in df.columns:
-            df["icebreaker"] = ""
-        
+        for col in ["companyName", "servicio_destacado", "competidores", "ranking", "icebreaker"]:
+            if col not in df.columns:
+                df[col] = ""
         st.session_state.df_results = df
         st.session_state.processing = False
-        st.session_state.processed_count = 0
 
-    st.subheader("Vista previa de Datos")
-    
-    # Mostrar el dataframe actual
-    # st.dataframe permite visualización interactiva parecida a Clay
+    st.subheader("Datos")
     df_placeholder = st.empty()
-    df_placeholder.dataframe(st.session_state.df_results, use_container_width=True)
+    df_placeholder.dataframe(st.session_state.df_results, use_container_width=True, height=400)
 
-    col1, col2 = st.columns([1, 4])
-    
+    col1, col2, col3 = st.columns([1, 1, 3])
+
     with col1:
-        start_btn = st.button("🚀 Ejecutar Enriquecimiento", type="primary", disabled=st.session_state.processing)
-    
+        start_btn = st.button("Ejecutar Enriquecimiento", type="primary", disabled=st.session_state.processing)
+    with col2:
+        reset_btn = st.button("Reiniciar datos")
+
+    if reset_btn:
+        del st.session_state["df_results"]
+        st.rerun()
+
     if start_btn:
         if not openai_api_key:
-            st.error("⚠️ La API Key de OpenAI no está configurada. Revisa tus variables de entorno (.env o Secrets).")
+            st.error("Falta OPENAI_API_KEY. Revisa tu archivo .env o las Secrets de Streamlit Cloud.")
         else:
             st.session_state.processing = True
-            
-            # Limitar filas si está configurado
+
             df_to_process = st.session_state.df_results
-            filas_a_procesar = len(df_to_process)
-            if max_filas > 0:
-                filas_a_procesar = min(len(df_to_process), max_filas)
-            
+            total = len(df_to_process) if max_filas == 0 else min(len(df_to_process), max_filas)
+
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
-            # Procesar fila por fila
-            for index in range(filas_a_procesar):
-                row = df_to_process.iloc[index]
-                website_url = str(row.get("website", ""))
-                
-                # Omitir si ya está procesada (tiene icebreaker)
-                if pd.notna(row.get("icebreaker")) and str(row.get("icebreaker")).strip() != "":
-                    progress_bar.progress((index + 1) / filas_a_procesar)
+            log_container = st.expander("Log de procesamiento", expanded=True)
+
+            for i in range(total):
+                row = df_to_process.iloc[i]
+                raw_name = str(row.get("name", "")) if pd.notna(row.get("name")) else ""
+                website_url = str(row.get("website", "")) if pd.notna(row.get("website")) else ""
+                state = str(row.get("state", "")) if pd.notna(row.get("state")) else ""
+
+                # Saltar filas ya procesadas
+                existing_ice = str(row.get("icebreaker", "")).strip()
+                if existing_ice and existing_ice != "":
+                    progress_bar.progress((i + 1) / total)
                     continue
 
-                status_text.text(f"Procesando fila {index+1}/{filas_a_procesar}: {row.get('name', 'Desconocido')}...")
-                
+                status_text.text(f"Fila {i+1}/{total}: {raw_name}...")
+
                 # FASE 1: Normalizar nombre
-                if pd.isna(row.get("companyName")) or str(row.get("companyName")).strip() == "":
-                    comp_name = normalize_name(row.get("name", ""))
-                    df_to_process.at[index, "companyName"] = comp_name
-                else:
-                    comp_name = row.get("companyName")
-                
-                df_placeholder.dataframe(df_to_process, use_container_width=True)
-                
+                with log_container:
+                    st.write(f"**[{i+1}/{total}] {raw_name}**")
+
+                comp_name = str(row.get("companyName", "")).strip()
+                if not comp_name:
+                    comp_name = normalize_name(raw_name)
+                    df_to_process.at[i, "companyName"] = comp_name
+                    with log_container:
+                        st.write(f"  Nombre: {raw_name} → {comp_name}")
+                    df_placeholder.dataframe(df_to_process, use_container_width=True, height=400)
+
                 # FASE 2: Servicio Destacado
-                if pd.isna(row.get("servicio_destacado")) or str(row.get("servicio_destacado")).strip() == "":
+                servicio = str(row.get("servicio_destacado", "")).strip()
+                if not servicio:
                     servicio = get_servicio_destacado(website_url)
-                    df_to_process.at[index, "servicio_destacado"] = servicio
-                else:
-                    servicio = row.get("servicio_destacado")
-                
-                df_placeholder.dataframe(df_to_process, use_container_width=True)
-                
-                # FASE 2.5: Búsqueda real en Google (Serper.dev)
-                if "competidores" not in df_to_process.columns:
-                    df_to_process["competidores"] = ""
-                if "ranking" not in df_to_process.columns:
-                    df_to_process["ranking"] = ""
-                    
-                state = str(row.get("state", "")) if pd.notna(row.get("state")) else ""
+                    df_to_process.at[i, "servicio_destacado"] = servicio
+                    with log_container:
+                        st.write(f"  Servicio: {servicio}")
+                    df_placeholder.dataframe(df_to_process, use_container_width=True, height=400)
+
+                # FASE 2.5: Google Search
                 serp_data = get_google_ranking(servicio, state, website_url)
                 comps = serp_data["competidores"]
                 ranking = serp_data["ranking"]
-                df_to_process.at[index, "competidores"] = comps
-                df_to_process.at[index, "ranking"] = ranking
-                
-                df_placeholder.dataframe(df_to_process, use_container_width=True)
-                
-                # FASE 3: Icebreaker (centrado en competidores y ranking real)
-                if pd.isna(row.get("icebreaker")) or str(row.get("icebreaker")).strip() == "":
-                    ice = generate_icebreaker(comp_name, state, servicio, comps, ranking)
-                    df_to_process.at[index, "icebreaker"] = ice
-                
-                # Actualizar UI en vivo final de fila
-                df_placeholder.dataframe(df_to_process, use_container_width=True)
-                
-                progress_bar.progress((index + 1) / filas_a_procesar)
-                
-                # Pequeña pausa para no saturar APIs
-                time.sleep(0.5)
-            
-            status_text.text("✅ ¡Enriquecimiento completado!")
+                df_to_process.at[i, "competidores"] = comps
+                df_to_process.at[i, "ranking"] = ranking
+                with log_container:
+                    st.write(f"  Competidores: {comps}")
+                    st.write(f"  Ranking: {ranking}")
+                df_placeholder.dataframe(df_to_process, use_container_width=True, height=400)
+
+                # FASE 3: Icebreaker
+                ice = generate_icebreaker(comp_name, state, servicio, comps, ranking)
+                df_to_process.at[i, "icebreaker"] = ice
+                with log_container:
+                    st.write(f"  Icebreaker: {ice}")
+
+                df_placeholder.dataframe(df_to_process, use_container_width=True, height=400)
+                progress_bar.progress((i + 1) / total)
+                time.sleep(0.3)
+
+            status_text.text("Enriquecimiento completado.")
             st.session_state.processing = False
             st.session_state.df_results = df_to_process
             st.rerun()
 
-    # ==========================================
-    # BOTÓN DE EXPORTACIÓN (Instantly format)
-    # ==========================================
+    # Exportación
     if not st.session_state.processing:
-        st.markdown("### Exportar Resultados")
-        
-        # Generar CSV para descargar
-        csv_data = st.session_state.df_results.to_csv(index=False).encode('utf-8')
+        st.markdown("---")
+        csv_data = st.session_state.df_results.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="📥 Descargar CSV para Instantly",
+            label="Descargar CSV enriquecido",
             data=csv_data,
             file_name="leads_enriquecidos.csv",
             mime="text/csv",
