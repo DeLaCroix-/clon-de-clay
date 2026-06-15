@@ -87,17 +87,38 @@ def get_servicio_destacado(website_url: str) -> str:
 
     # Paso 1: Usar Jina Reader API para obtener contenido limpio en Markdown
     jina_url = f"https://r.jina.ai/{website_url}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "X-Return-Format": "markdown"
+    }
     if jina_api_key:
         headers["Authorization"] = f"Bearer {jina_api_key}"
     
     text_content = ""
     try:
-        res = requests.get(jina_url, headers=headers, timeout=15)
+        # Añadimos logs para depurar el error de scraping
+        print(f"Haciendo scraping con Jina a: {jina_url}")
+        res = requests.get(jina_url, headers=headers, timeout=20)
+        print(f"Jina status code: {res.status_code}")
         if res.status_code == 200:
-            text_content = res.text[:4000] # Limitar a los primeros 4000 caracteres
+            text_content = res.text[:8000] # Limitar caracteres (lo ampliamos un poco si Jina devuelve algo)
+        else:
+            print(f"Jina error: {res.text[:200]}")
+            # Fallback simple con requests normal
+            print("Intentando fallback con Requests normal...")
+            fallback_res = requests.get(website_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if fallback_res.status_code == 200:
+                text_content = fallback_res.text[:8000]
     except Exception as e:
-        pass
+        print(f"Jina request failed: {str(e)}")
+        try:
+            print("Intentando fallback con Requests normal...")
+            fallback_res = requests.get(website_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            if fallback_res.status_code == 200:
+                text_content = fallback_res.text[:8000]
+        except Exception:
+            pass
     
     if not text_content:
         return "su servicio principal"
@@ -110,7 +131,7 @@ def get_servicio_destacado(website_url: str) -> str:
 Dime cuál es el servicio o tratamiento más destacado que ofrecen en la empresa.
 Devuelve SOLO el nombre del servicio, en español, en 2-5 palabras máximo.
 Ejemplos: "rinoplastia de preservación", "medicina estética facial", "cirugía de párpados", "vaciado de naves industriales", "vaciado de pisos", "reparación de embragues" .
-Si no puedes determinarlo, devuelve "indeterminado".
+Si no puedes determinarlo o la web no parece tener servicios claros, devuelve "indeterminado".
 No expliques nada. Solo el nombre."""
 
     try:
@@ -122,12 +143,14 @@ No expliques nada. Solo el nombre."""
             temperature=0.3
         )
         result = response.choices[0].message.content.strip()
+        print(f"GPT resultado servicio: {result}")
         # Si GPT responde con algo muy largo por error, lo forzamos al fallback
         if len(result.split()) > 10:
             return "su servicio principal"
         # Limpiar comillas si devolvió comillas
         return result.replace('"', '').replace("'", "")
     except Exception as e:
+        print(f"GPT error en servicio: {str(e)}")
         return "su servicio principal"
 
 # Ya no analizaremos el tech stack (WordPress, etc.) porque le daremos más peso a los competidores.
