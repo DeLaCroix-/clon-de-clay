@@ -1,5 +1,22 @@
-venv/
-__pycache__/
+# API Keys y secretos
 .env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
 .DS_Store
-terminals/
+Thumbs.db
+
+# Datos de prueba locales
+*.csv
+!sample_leads.csv
