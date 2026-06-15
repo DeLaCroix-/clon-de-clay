@@ -1,17 +1,37 @@
 import os
+import sys
 import streamlit as st
 import pandas as pd
 import openai
 import requests
 import time
+import warnings
 from pathlib import Path
 from io import BytesIO
 from urllib.parse import urlparse
-from dotenv import load_dotenv
 
-# Cargar .env desde la misma carpeta que este script (evita problemas de CWD en Streamlit)
-_env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=_env_path)
+warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+
+# ==========================================
+# CARGA DE API KEYS (a prueba de fallos)
+# ==========================================
+def _load_env_file():
+    """Lee el .env manualmente, sin depender de load_dotenv ni st.secrets."""
+    env_vars = {}
+    env_path = Path(__file__).resolve().parent / ".env"
+    if env_path.exists():
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env_vars[key.strip()] = value.strip().strip('"').strip("'")
+    return env_vars
+
+_env = _load_env_file()
+openai_api_key = os.environ.get("OPENAI_API_KEY") or _env.get("OPENAI_API_KEY", "")
+serper_api_key = os.environ.get("SERPER_API_KEY") or _env.get("SERPER_API_KEY", "")
+jina_api_key = os.environ.get("JINA_API_KEY") or _env.get("JINA_API_KEY", "")
 
 st.set_page_config(page_title="Clon de Clay", layout="wide")
 st.title("Pipeline de Enriquecimiento de Leads")
@@ -21,13 +41,13 @@ st.title("Pipeline de Enriquecimiento de Leads")
 # ==========================================
 st.sidebar.header("Estado de APIs")
 
-openai_api_key = os.environ.get("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", "")
-serper_api_key = os.environ.get("SERPER_API_KEY") or st.secrets.get("SERPER_API_KEY", "")
-jina_api_key = os.environ.get("JINA_API_KEY") or st.secrets.get("JINA_API_KEY", "")
-
-st.sidebar.markdown(f"- OpenAI: {'✅ Conectada' if openai_api_key else '❌ Falta'}")
-st.sidebar.markdown(f"- Serper: {'✅ Conectada' if serper_api_key else '❌ Falta'}")
+st.sidebar.markdown(f"- OpenAI: {'✅ Conectada' if openai_api_key else '❌ **FALTA**'}")
+st.sidebar.markdown(f"- Serper: {'✅ Conectada' if serper_api_key else '❌ **FALTA**'}")
 st.sidebar.markdown(f"- Jina:   {'✅ Conectada' if jina_api_key else '⚠️ Opcional'}")
+
+if not openai_api_key or not serper_api_key:
+    env_path = Path(__file__).resolve().parent / ".env"
+    st.sidebar.error(f"Archivo .env buscado en: {env_path} ({'existe' if env_path.exists() else 'NO EXISTE'})")
 
 st.sidebar.markdown("---")
 max_filas = st.sidebar.number_input("Filas a procesar (0 = todas)", min_value=0, value=10, step=1)
