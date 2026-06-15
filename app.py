@@ -56,7 +56,7 @@ def normalize_name(raw_name: str) -> str:
     if not raw_name or pd.isna(raw_name):
         return ""
     
-    prompt = f"""Limpia y normaliza el nombre de esta clínica o médico para usarlo en un email de marketing profesional en español. El valor original es: {raw_name}
+    prompt = f"""Limpia y normaliza el nombre de esta clínica o médico o empresa para usarlo en un email de marketing profesional en español. El valor original es: {raw_name}
 
 Reglas de limpieza:
 1. Si el nombre está todo junto sin espacios (ej: "Drcolomer", "Drlalinde", "Faceliftbarcelona", "Drgarcia Paricio"), separa correctamente las palabras y añade puntos donde corresponda (ej: "Dr. Colomer", "Dr. Lalinde", "Facelift Barcelona", "Dr. García Paricio").
@@ -103,14 +103,14 @@ def get_servicio_destacado(website_url: str) -> str:
         return "su servicio principal"
 
     # Paso 2: Usar GPT-4o para extraer el servicio principal de ese texto
-    prompt = f"""Analiza este contenido de una web médica o clínica:
+    prompt = f"""Analiza este contenido de una web:
 
 {text_content}
 
-Dime cuál es el servicio o tratamiento más destacado que ofrecen.
+Dime cuál es el servicio o tratamiento más destacado que ofrecen en la empresa.
 Devuelve SOLO el nombre del servicio, en español, en 2-5 palabras máximo.
-Ejemplos: "rinoplastia de preservación", "medicina estética facial", "cirugía de párpados".
-Si no puedes determinarlo, devuelve "su servicio principal".
+Ejemplos: "rinoplastia de preservación", "medicina estética facial", "cirugía de párpados", "vaciado de naves industriales", "vaciado de pisos", "reparación de embragues" .
+Si no puedes determinarlo, devuelve "indeterminado".
 No expliques nada. Solo el nombre."""
 
     try:
@@ -130,55 +130,12 @@ No expliques nada. Solo el nombre."""
     except Exception as e:
         return "su servicio principal"
 
-def detect_tech_stack(website_url: str) -> str:
-    """Fase 2.5: Extracción de Tech Stack (WordPress, Analytics) a partir de código fuente nativo"""
-    if not website_url or pd.isna(website_url):
-        return "No pudimos acceder a vuestra web"
-
-    if not website_url.startswith("http"):
-        website_url = "https://" + website_url
-        
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        res = requests.get(website_url, headers=headers, timeout=10)
-        
-        if res.status_code != 200:
-            return "Vuestra web parece estar inaccesible temporalmente"
-            
-        html_content = res.text.lower()
-        
-        # Tecnologías básicas a detectar
-        is_wp = "wp-content" in html_content or "wp-includes" in html_content
-        has_ga = "gtag" in html_content or "analytics.js" in html_content or "google-analytics.com" in html_content
-        has_fb_pixel = "fbq(" in html_content or "fbevents.js" in html_content
-        
-        # Generamos la frase del tech stack
-        tech_status = []
-        
-        if is_wp:
-            tech_status.append("vuestra web está hecha en WordPress")
-        else:
-            tech_status.append("vuestra web tiene un CMS personalizado")
-            
-        if not has_ga and not has_fb_pixel:
-            tech_status.append("pero no tenéis configurados los píxeles de conversión (ni Google Analytics ni Facebook Pixel)")
-        elif has_ga and not has_fb_pixel:
-            tech_status.append("y aunque usáis Google Analytics, parece que os falta el píxel de Meta para retargeting")
-        elif not has_ga and has_fb_pixel:
-            tech_status.append("y aunque usáis el Píxel de Meta, no veo Google Analytics implementado para medir el tráfico SEO")
-            
-        if len(tech_status) == 1:
-            return tech_status[0]
-            
-        return f"{tech_status[0]} {tech_status[1]}"
-        
-    except Exception:
-        return "No hemos podido analizar la estructura técnica de vuestra web"
+# Ya no analizaremos el tech stack (WordPress, etc.) porque le daremos más peso a los competidores.
+# def detect_tech_stack(website_url: str) -> str:
+# ...
 
 def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> tuple[str, str]:
-    """Fase 2.6: Búsqueda Real en Google usando Serper.dev para extraer ranking y competidores"""
+    """Fase 2.6: Búsqueda Real en Google usando Serper.dev extraído del Motor SEO Beta"""
     if not serper_api_key:
         return ("(Sin API Key de Serper)", "en los resultados")
         
@@ -203,10 +160,10 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> tuple[st
         url = "https://google.serper.dev/search"
         payload = {
             "q": query,
-            "location": "Spain",
             "gl": "es",
             "hl": "es",
-            "num": 30 # Traer 30 resultados
+            "num": 30, # Ampliamos a 30 resultados para encontrar al lead si está en paginas 2-3
+            "type": "search"
         }
         headers = {
             'X-API-KEY': serper_api_key,
@@ -216,14 +173,23 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> tuple[st
         response = requests.post(url, headers=headers, json=payload, timeout=15)
         data = response.json()
         
-        organics = data.get("organic", [])
+        organic = data.get("organic", [])
         
-        if not organics:
+        # Filtrar resultados (igual que en el Motor SEO Beta)
+        filtered_organic = []
+        for r in organic:
+            link = r.get("link", "").lower()
+            is_youtube = "youtube.com" in link or "youtu.be" in link
+            is_maps = "maps.google" in link or "google.com/maps" in link
+            if not is_youtube and not is_maps:
+                filtered_organic.append(r)
+                
+        if not filtered_organic:
             return ("competidores", "en la primera página")
             
         # 1. Encontrar en qué posición/página está nuestro lead
         lead_rank = -1
-        for i, res in enumerate(organics):
+        for i, res in enumerate(filtered_organic):
             link = res.get("link", "").lower()
             if domain.lower() in link:
                 lead_rank = i + 1
@@ -242,7 +208,7 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> tuple[st
         directorios = ["topdoctors", "doctoralia", "multiestetica", "sanitas", "quironsalud", "clinicbook"]
         competidores = []
         
-        for res in organics:
+        for res in filtered_organic:
             link = res.get("link", "").lower()
             title = res.get("title", "")
             
@@ -272,7 +238,7 @@ def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> tuple[st
     except Exception as e:
         return ("otros especialistas", "en las primeras páginas")
 
-def generate_icebreaker(company_name: str, city: str, servicio: str, tech_stack: str, competidores: str, google_page: str) -> str:
+def generate_icebreaker(company_name: str, city: str, servicio: str, competidores: str, google_page: str) -> str:
     """Fase 3: Generación del Icebreaker SEO Prospección (Avanzado V2)"""
     if not company_name or not city:
         return ""
@@ -289,9 +255,8 @@ Esta frase debe:
 1. Mencionar que buscaste el servicio estrella de la clínica en Google en su ciudad
 2. Mencionar de forma natural a sus competidores que sí están rankeando bien
 3. Señalar en qué posición o situación están ellos en Google
-4. Mencionar sutilmente un detalle técnico sobre su web (el tech stack)
-5. Sonar conversacional, profesional y observador, como si lo escribiera una persona real de España
-6. Tener máximo 3 líneas. Sin saludos, sin punto al final.
+4. Sonar conversacional, profesional y observador, como si lo escribiera una persona real de España
+5. Tener máximo 3 líneas. Sin saludos, sin punto al final.
 
 IMPORTANTE - Lenguaje: Escribe en español de España. NUNCA uses estas expresiones latinoamericanas:
 - "Recientemente busqué" -> usa "He buscado" o "Buscando"
@@ -306,10 +271,9 @@ Datos recolectados para personalizar:
 - Búsqueda realizada: "{servicio} en {city}"
 - Competidores rankeando arriba: {competidores}
 - Posición real del lead: {google_page}
-- Análisis técnico de su web: {tech_stack}
 
 Ejemplo de estructura esperada (¡no la copies literal, úsala de guía para el tono!): 
-"He buscado '[servicio]' en [ciudad] y he visto que [competidores] están acaparando la primera página mientras que vosotros [posición real]. Además, al revisar vuestra web he visto que [detalle técnico], lo que os está haciendo perder pacientes."
+"He buscado '[servicio]' en [ciudad] y he visto que [competidores] están acaparando la primera página mientras que vosotros [posición real], lo que os está haciendo perder pacientes."
 
 Devuelve SOLO la frase. Sin comillas, sin explicaciones."""
 
@@ -408,13 +372,6 @@ if uploaded_file is not None:
                 
                 df_placeholder.dataframe(df_to_process, use_container_width=True)
                 
-                # FASE 2.5: Tech Stack
-                if "tech_stack" not in df_to_process.columns:
-                    df_to_process["tech_stack"] = ""
-                    
-                tech_stack = detect_tech_stack(website_url)
-                df_to_process.at[index, "tech_stack"] = tech_stack
-                
                 # FASE 2.6: Google Search
                 if "competidores" not in df_to_process.columns:
                     df_to_process["competidores"] = ""
@@ -430,7 +387,7 @@ if uploaded_file is not None:
                 
                 # FASE 3: Icebreaker Evolucionado
                 if pd.isna(row.get("icebreaker")) or str(row.get("icebreaker")).strip() == "":
-                    ice = generate_icebreaker(comp_name, state, servicio, tech_stack, comps, ranking)
+                    ice = generate_icebreaker(comp_name, state, servicio, comps, ranking)
                     df_to_process.at[index, "icebreaker"] = ice
                 
                 # Actualizar UI en vivo final de fila
