@@ -4,8 +4,6 @@ import pandas as pd
 import openai
 import requests
 import time
-import base64
-import re
 from io import BytesIO
 from urllib.parse import urlparse
 from dotenv import load_dotenv
@@ -87,38 +85,17 @@ def get_servicio_destacado(website_url: str) -> str:
 
     # Paso 1: Usar Jina Reader API para obtener contenido limpio en Markdown
     jina_url = f"https://r.jina.ai/{website_url}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "X-Return-Format": "markdown"
-    }
+    headers = {"User-Agent": "Mozilla/5.0"}
     if jina_api_key:
         headers["Authorization"] = f"Bearer {jina_api_key}"
     
     text_content = ""
     try:
-        # Añadimos logs para depurar el error de scraping
-        print(f"Haciendo scraping con Jina a: {jina_url}")
-        res = requests.get(jina_url, headers=headers, timeout=20)
-        print(f"Jina status code: {res.status_code}")
+        res = requests.get(jina_url, headers=headers, timeout=15)
         if res.status_code == 200:
-            text_content = res.text[:8000] # Limitar caracteres (lo ampliamos un poco si Jina devuelve algo)
-        else:
-            print(f"Jina error: {res.text[:200]}")
-            # Fallback simple con requests normal
-            print("Intentando fallback con Requests normal...")
-            fallback_res = requests.get(website_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-            if fallback_res.status_code == 200:
-                text_content = fallback_res.text[:8000]
+            text_content = res.text[:4000] # Limitar a los primeros 4000 caracteres
     except Exception as e:
-        print(f"Jina request failed: {str(e)}")
-        try:
-            print("Intentando fallback con Requests normal...")
-            fallback_res = requests.get(website_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
-            if fallback_res.status_code == 200:
-                text_content = fallback_res.text[:8000]
-        except Exception:
-            pass
+        pass
     
     if not text_content:
         return "su servicio principal"
@@ -131,7 +108,7 @@ def get_servicio_destacado(website_url: str) -> str:
 Dime cuál es el servicio o tratamiento más destacado que ofrecen en la empresa.
 Devuelve SOLO el nombre del servicio, en español, en 2-5 palabras máximo.
 Ejemplos: "rinoplastia de preservación", "medicina estética facial", "cirugía de párpados", "vaciado de naves industriales", "vaciado de pisos", "reparación de embragues" .
-Si no puedes determinarlo o la web no parece tener servicios claros, devuelve "indeterminado".
+Si no puedes determinarlo, devuelve "indeterminado".
 No expliques nada. Solo el nombre."""
 
     try:
@@ -143,130 +120,141 @@ No expliques nada. Solo el nombre."""
             temperature=0.3
         )
         result = response.choices[0].message.content.strip()
-        print(f"GPT resultado servicio: {result}")
         # Si GPT responde con algo muy largo por error, lo forzamos al fallback
         if len(result.split()) > 10:
             return "su servicio principal"
         # Limpiar comillas si devolvió comillas
         return result.replace('"', '').replace("'", "")
     except Exception as e:
-        print(f"GPT error en servicio: {str(e)}")
         return "su servicio principal"
 
-# Ya no analizaremos el tech stack (WordPress, etc.) porque le daremos más peso a los competidores.
-# def detect_tech_stack(website_url: str) -> str:
-# ...
+def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> dict:
+    """Búsqueda real en Google via Serper.dev (misma API que Motor SEO Beta de natconsulting-crm)"""
+    fallback = {
+        "competidores": "otros especialistas",
+        "ranking": "no hemos podido verificar vuestra posición",
+        "posicion_exacta": -1,
+    }
 
-def get_google_ranking(servicio: str, ciudad: str, website_url: str) -> tuple[str, str]:
-    """Fase 2.6: Búsqueda Real en Google usando Serper.dev extraído del Motor SEO Beta"""
     if not serper_api_key:
-        return ("(Sin API Key de Serper)", "en los resultados")
-        
+        return fallback
+
     if not servicio or not ciudad or not website_url:
-        return ("otros especialistas", "en los resultados")
-        
-    # Limpiar servicio para evitar "su servicio principal"
-    query_servicio = servicio
-    if "su servicio principal" in servicio.lower():
-        query_servicio = "clínica"
-        
-    query = f"{query_servicio} en {ciudad}"
-    
-    # Extraer el dominio base para buscarlo
+        return fallback
+
+    if "su servicio principal" in servicio.lower() or "indeterminado" in servicio.lower():
+        query = f"clínica en {ciudad}"
+    else:
+        query = f"{servicio} en {ciudad}"
+
     try:
-        domain = urlparse(website_url if website_url.startswith('http') else f"https://{website_url}").netloc
-        domain = domain.replace("www.", "")
-    except:
-        domain = website_url
-        
+        parsed = urlparse(website_url if website_url.startswith("http") else f"https://{website_url}")
+        lead_domain = parsed.netloc.replace("www.", "").lower()
+    except Exception:
+        lead_domain = website_url.lower()
+
     try:
-        url = "https://google.serper.dev/search"
-        payload = {
-            "q": query,
-            "gl": "es",
-            "hl": "es",
-            "num": 30, # Ampliamos a 30 resultados para encontrar al lead si está en paginas 2-3
-            "type": "search"
-        }
-        headers = {
-            'X-API-KEY': serper_api_key,
-            'Content-Type': 'application/json'
-        }
-        
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        data = response.json()
-        
+        # Payload idéntico al de beta-serp-fetch del Motor SEO Beta
+        res = requests.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": serper_api_key,
+                "Content-Type": "application/json",
+            },
+            json={
+                "q": query,
+                "gl": "es",
+                "hl": "es",
+                "num": 30,
+                "type": "search",
+            },
+            timeout=15,
+        )
+
+        if res.status_code != 200:
+            return fallback
+
+        data = res.json()
         organic = data.get("organic", [])
-        
-        # Filtrar resultados (igual que en el Motor SEO Beta)
-        filtered_organic = []
+
+        if not organic:
+            return fallback
+
+        # Filtrar YouTube y Maps (igual que beta-serp-fetch)
+        filtered = []
         for r in organic:
-            link = r.get("link", "").lower()
-            is_youtube = "youtube.com" in link or "youtu.be" in link
-            is_maps = "maps.google" in link or "google.com/maps" in link
-            if not is_youtube and not is_maps:
-                filtered_organic.append(r)
-                
-        if not filtered_organic:
-            return ("competidores", "en la primera página")
-            
-        # 1. Encontrar en qué posición/página está nuestro lead
-        lead_rank = -1
-        for i, res in enumerate(filtered_organic):
-            link = res.get("link", "").lower()
-            if domain.lower() in link:
-                lead_rank = i + 1
-                break
-                
-        if lead_rank == -1:
-            lead_page = "no aparecéis en las primeras 3 páginas de Google"
-        elif lead_rank <= 10:
-            lead_page = "aparecéis en la primera página, pero se puede mejorar la posición"
-        elif lead_rank <= 20:
-            lead_page = "aparecéis relegados a la página 2 de Google"
-        else:
-            lead_page = "aparecéis en la página 3 o inferior"
-            
-        # 2. Extraer 2 competidores (los primeros 2 que NO sean directorios)
-        directorios = ["topdoctors", "doctoralia", "multiestetica", "sanitas", "quironsalud", "clinicbook"]
-        competidores = []
-        
-        for res in filtered_organic:
-            link = res.get("link", "").lower()
-            title = res.get("title", "")
-            
-            # Si es nuestro lead, lo saltamos
-            if domain.lower() in link:
+            url_lower = r.get("link", "").lower()
+            if any(s in url_lower for s in ("youtube.com", "youtu.be", "maps.google", "google.com/maps")):
                 continue
-                
-            # Si es un directorio conocido, lo saltamos
-            is_dir = any(d in link for d in directorios)
-            if not is_dir:
-                # Limpiar el título (quitar " - Inicio", etc)
-                clean_title = title.split(" - ")[0].split(" | ")[0]
-                competidores.append(clean_title)
-                
+            filtered.append(r)
+
+        # Re-indexar posiciones tras filtrado
+        for idx, r in enumerate(filtered):
+            r["_pos"] = idx + 1
+
+        # 1. Buscar la posición del lead
+        lead_pos = -1
+        for r in filtered:
+            if lead_domain in r.get("link", "").lower():
+                lead_pos = r["_pos"]
+                break
+
+        if lead_pos == -1:
+            ranking_text = "no aparecéis en los primeros 30 resultados de Google"
+        elif lead_pos <= 3:
+            ranking_text = f"aparecéis en la posición {lead_pos}, pero se puede mejorar"
+        elif lead_pos <= 10:
+            ranking_text = f"estáis en la posición {lead_pos} de la primera página"
+        elif lead_pos <= 20:
+            ranking_text = f"estáis relegados a la posición {lead_pos} (página 2 de Google)"
+        else:
+            ranking_text = f"estáis en la posición {lead_pos}, es decir, página 3 o inferior"
+
+        # 2. Extraer competidores reales (saltando directorios y al propio lead)
+        directorios = [
+            "topdoctors", "doctoralia", "multiestetica", "sanitas",
+            "quironsalud", "clinicbook", "wikipedia", "yelp",
+            "paginasamarillas", "infojobs", "milanuncios",
+        ]
+        competidores = []
+
+        for r in filtered:
+            link = r.get("link", "").lower()
+            title = r.get("title", "")
+
+            if lead_domain in link:
+                continue
+            if any(d in link for d in directorios):
+                continue
+
+            clean_title = title.split(" - ")[0].split(" | ")[0].strip()
+            if clean_title:
+                competidores.append({"nombre": clean_title, "posicion": r["_pos"]})
+
             if len(competidores) >= 2:
                 break
-                
-        if len(competidores) == 2:
-            comps_text = f"{competidores[0]} y {competidores[1]}"
+
+        if len(competidores) >= 2:
+            comps_text = f"{competidores[0]['nombre']} (posición {competidores[0]['posicion']}) y {competidores[1]['nombre']} (posición {competidores[1]['posicion']})"
         elif len(competidores) == 1:
-            comps_text = competidores[0]
+            comps_text = f"{competidores[0]['nombre']} (posición {competidores[0]['posicion']})"
         else:
             comps_text = "otros especialistas"
-            
-        return (comps_text, lead_page)
-        
-    except Exception as e:
-        return ("otros especialistas", "en las primeras páginas")
+
+        return {
+            "competidores": comps_text,
+            "ranking": ranking_text,
+            "posicion_exacta": lead_pos,
+        }
+
+    except Exception:
+        return fallback
 
 def generate_icebreaker(company_name: str, city: str, servicio: str, competidores: str, google_page: str) -> str:
-    """Fase 3: Generación del Icebreaker SEO Prospección (Avanzado V2)"""
+    """Fase 3: Generación del Icebreaker SEO Prospección (centrado en competidores)"""
     if not company_name or not city:
         return ""
-    
-    # Manejo de fallbacks
+
     if pd.isna(servicio) or not servicio:
         servicio = "su servicio principal"
     if pd.isna(city):
@@ -275,28 +263,28 @@ def generate_icebreaker(company_name: str, city: str, servicio: str, competidore
     prompt = f"""Eres un experto en copywriting de cold email B2B en español de España. Tu tarea es escribir UNA sola frase de apertura (icebreaker) para un email de prospección SEO.
 
 Esta frase debe:
-1. Mencionar que buscaste el servicio estrella de la clínica en Google en su ciudad
-2. Mencionar de forma natural a sus competidores que sí están rankeando bien
-3. Señalar en qué posición o situación están ellos en Google
-4. Sonar conversacional, profesional y observador, como si lo escribiera una persona real de España
-5. Tener máximo 3 líneas. Sin saludos, sin punto al final.
+1. Decir que has buscado el servicio estrella de la empresa en Google en su ciudad
+2. Nombrar a sus competidores reales que están por encima (con su posición si la tienes)
+3. Señalar la posición o situación real del lead en Google
+4. Sonar natural, conversacional y profesional, como si lo escribiera una persona real de España
+5. Tener máximo 2 líneas. Sin saludos, sin punto al final
 
 IMPORTANTE - Lenguaje: Escribe en español de España. NUNCA uses estas expresiones latinoamericanas:
 - "Recientemente busqué" -> usa "He buscado" o "Buscando"
 - "Estuve buscando" -> usa "He estado buscando" o "Buscando"
 - "Explorando" -> usa "Buscando" o "Mirando"
-- "Me sorprendió" -> usa "He notado" o "Me he dado cuenta"
+- "Me sorprendió" -> usa "He notado" o "He visto"
 Usa siempre construcciones con presente perfecto ("He buscado", "He visto") o gerundio ("Buscando").
 
-Datos recolectados para personalizar:
-- Clínica objetivo: {company_name}
+Datos reales de la búsqueda en Google:
+- Empresa objetivo: {company_name}
 - Ciudad: {city}
-- Búsqueda realizada: "{servicio} en {city}"
-- Competidores rankeando arriba: {competidores}
-- Posición real del lead: {google_page}
+- Búsqueda realizada en Google: "{servicio} en {city}"
+- Competidores que están por encima: {competidores}
+- Posición del lead: {google_page}
 
-Ejemplo de estructura esperada (¡no la copies literal, úsala de guía para el tono!): 
-"He buscado '[servicio]' en [ciudad] y he visto que [competidores] están acaparando la primera página mientras que vosotros [posición real], lo que os está haciendo perder pacientes."
+Ejemplo de estructura (NO la copies literal, úsala solo de guía para el tono):
+"He buscado '{servicio} en {city}' como lo haría un paciente y he visto que {competidores} copan los primeros puestos, mientras que {company_name} {google_page}"
 
 Devuelve SOLO la frase. Sin comillas, sin explicaciones."""
 
@@ -306,11 +294,11 @@ Devuelve SOLO la frase. Sin comillas, sin explicaciones."""
             model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
-            temperature=0.7
+            temperature=0.7,
         )
         result = response.choices[0].message.content.strip()
         return result.replace('"', '')
-    except Exception as e:
+    except Exception:
         return ""
 
 # ==========================================
@@ -395,20 +383,22 @@ if uploaded_file is not None:
                 
                 df_placeholder.dataframe(df_to_process, use_container_width=True)
                 
-                # FASE 2.6: Google Search
+                # FASE 2.5: Búsqueda real en Google (Serper.dev)
                 if "competidores" not in df_to_process.columns:
                     df_to_process["competidores"] = ""
                 if "ranking" not in df_to_process.columns:
                     df_to_process["ranking"] = ""
                     
                 state = str(row.get("state", "")) if pd.notna(row.get("state")) else ""
-                comps, ranking = get_google_ranking(servicio, state, website_url)
+                serp_data = get_google_ranking(servicio, state, website_url)
+                comps = serp_data["competidores"]
+                ranking = serp_data["ranking"]
                 df_to_process.at[index, "competidores"] = comps
                 df_to_process.at[index, "ranking"] = ranking
                 
                 df_placeholder.dataframe(df_to_process, use_container_width=True)
                 
-                # FASE 3: Icebreaker Evolucionado
+                # FASE 3: Icebreaker (centrado en competidores y ranking real)
                 if pd.isna(row.get("icebreaker")) or str(row.get("icebreaker")).strip() == "":
                     ice = generate_icebreaker(comp_name, state, servicio, comps, ranking)
                     df_to_process.at[index, "icebreaker"] = ice
